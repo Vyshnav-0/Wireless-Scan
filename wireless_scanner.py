@@ -17,6 +17,8 @@ import json
 from typing import Dict, Optional
 import signal
 import atexit
+import time
+import threading
 
 # Initialize console for rich output
 console = Console()
@@ -257,112 +259,129 @@ def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
 def create_device_table():
     """Create and update the device table"""
     table = Table(box=box.ROUNDED)
-    table.add_column("MAC Address", style="cyan")
-    table.add_column("Company", style="magenta")
-    table.add_column("Device Type", style="red")
-    table.add_column("SSID/Name", style="green")
-    table.add_column("Signal Strength", style="yellow")
-    table.add_column("Details", style="white")
-    
-    for mac, info in discovered_devices.items():
-        signal_strength = f"{info['signal_strength']} dBm"
+    table.add_column("MAC Address", style="cyan", width=17)
+    table.add_column("Company", style="magenta", width=20)
+    table.add_column("Type", style="red", width=15)
+    table.add_column("Name/SSID", style="green", width=20)
+    table.add_column("Signal", style="yellow", width=8)
+    table.add_column("Last Seen", style="blue", width=8)
+
+    # Sort devices by signal strength
+    sorted_devices = sorted(
+        discovered_devices.items(),
+        key=lambda x: x[1]['signal_strength'],
+        reverse=True
+    )
+
+    for mac, info in sorted_devices:
+        # Skip devices not seen in last 60 seconds
+        if (datetime.now() - info['last_seen']).total_seconds() > 60:
+            continue
+
+        signal = f"{info['signal_strength']} dBm"
         device_type = info['device_type']
-        style = "bold red" if device_type == "Projector" else None
-        
-        details = []
-        if info.get('connection_type'):
-            details.append(info['connection_type'])
-        if info.get('last_seen'):
-            details.append(f"Last seen: {info['last_seen'].strftime('%H:%M:%S')}")
-        
+        name = info['ssid'] if info['ssid'] else 'N/A'
+        last_seen = info['last_seen'].strftime("%H:%M:%S")
+
+        # Determine row style
+        style = None
+        if info['is_ap']:
+            style = "bold blue"
+        elif device_type == "Projector":
+            style = "bold red"
+        elif device_type != "Unknown":
+            style = "bold white"
+
         table.add_row(
             mac,
             info['company'],
             device_type,
-            info['ssid'] or "N/A",
-            signal_strength,
-            "\n".join(details) if details else "",
+            name,
+            signal,
+            last_seen,
             style=style
         )
+
     return table
 
 def packet_handler(pkt):
     """Handle captured packets"""
     try:
-        # Check for management frames and data frames
-        if pkt.haslayer(Dot11):
-            # Get MAC addresses from different frame types
-            mac_address = None
-            if pkt.addr2:  # Source MAC
-                mac_address = pkt.addr2
-            elif pkt.addr1:  # Destination MAC
-                mac_address = pkt.addr1
-            
-            if not mac_address:
-                return
-            
-            # Try different methods to get signal strength
+        # Only process packets with a MAC address
+        if not pkt.haslayer(Dot11):
+            return
+
+        # Get device MAC address (prioritize source address)
+        mac_address = None
+        if pkt.addr2:  # Source MAC
+            mac_address = pkt.addr2
+        elif pkt.addr1 and pkt.addr1 not in ["ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"]:
+            mac_address = pkt.addr1
+
+        if not mac_address:
+            return
+
+        # Get signal strength
+        signal_strength = None
+        if hasattr(pkt, 'dBm_AntSignal'):
+            signal_strength = pkt.dBm_AntSignal
+        elif hasattr(pkt, 'notdecoded') and len(pkt.notdecoded) >= 4:
+            signal_strength = -(256-ord(pkt.notdecoded[-4:-3]))
+        else:
+            signal_strength = -100
+
+        # Process new device
+        if mac_address not in discovered_devices:
+            company, device_type = get_device_info(mac_address)
+            discovered_devices[mac_address] = {
+                'first_seen': datetime.now(),
+                'last_seen': datetime.now(),
+                'signal_strength': signal_strength,
+                'ssid': None,
+                'device_type': device_type,
+                'company': company,
+                'connection_type': None,
+                'probe_requests': set(),
+                'is_ap': False
+            }
+
+        device_info = discovered_devices[mac_address]
+        device_info['last_seen'] = datetime.now()
+
+        # Update signal strength if better
+        if signal_strength and signal_strength > device_info['signal_strength']:
+            device_info['signal_strength'] = signal_strength
+
+        # Process different packet types
+        if pkt.haslayer(Dot11Beacon):
+            device_info['is_ap'] = True
+            device_info['device_type'] = 'Access Point'
+            if pkt.info:
+                try:
+                    device_info['ssid'] = pkt.info.decode()
+                except:
+                    pass
+
+        elif pkt.haslayer(Dot11ProbeReq) and pkt.info:
             try:
-                if hasattr(pkt, 'dBm_AntSignal'):
-                    signal_strength = pkt.dBm_AntSignal
-                elif pkt.haslayer(RadioTap):
-                    signal_strength = -(256-ord(pkt.notdecoded[-4:-3]))
-                else:
-                    signal_strength = -100  # Default value
-            except:
-                signal_strength = -100
-            
-            # Process the device
-            if mac_address not in discovered_devices:
-                company, device_type = get_device_info(mac_address)
-                discovered_devices[mac_address] = {
-                    'first_seen': datetime.now(),
-                    'last_seen': datetime.now(),
-                    'signal_strength': signal_strength,
-                    'ssid': None,
-                    'device_type': device_type,
-                    'company': company,
-                    'connection_type': None,
-                    'probe_requests': set()  # Track probe requests
-                }
-                console.print(f"\n[bold green]New Device Found:[/bold green]")
-                console.print(f"MAC Address: [cyan]{mac_address}[/cyan]")
-                console.print(f"Company: [magenta]{company}[/magenta]")
-                console.print(f"Type: [red]{device_type}[/red]")
-                console.print(f"Signal Strength: [yellow]{signal_strength} dBm[/yellow]")
-            
-            device_info = discovered_devices[mac_address]
-            device_info['last_seen'] = datetime.now()
-            
-            # Update signal strength if stronger
-            if signal_strength > device_info['signal_strength']:
-                device_info['signal_strength'] = signal_strength
-            
-            # Handle different frame types
-            if pkt.haslayer(Dot11Beacon):
-                if pkt.info:
-                    try:
-                        ssid = pkt.info.decode()
-                        device_info['ssid'] = ssid
-                        # Update device type based on SSID
-                        company, new_type = get_device_info(mac_address, ssid)
-                        if new_type != "Unknown":
+                ssid = pkt.info.decode()
+                if ssid:
+                    device_info['probe_requests'].add(ssid)
+                    # Update device type based on probe request
+                    if device_info['device_type'] == 'Unknown':
+                        _, new_type = get_device_info(mac_address, ssid)
+                        if new_type != 'Unknown':
                             device_info['device_type'] = new_type
-                    except:
-                        pass
-            
-            # Handle probe requests (devices actively scanning)
-            elif pkt.haslayer(Dot11ProbeReq):
-                if pkt.info:
-                    try:
-                        probe_ssid = pkt.info.decode()
-                        if probe_ssid:
-                            device_info['probe_requests'].add(probe_ssid)
-                    except:
-                        pass
-    
+            except:
+                pass
+
+        # Detect active devices
+        if pkt.type == 2:  # Data frames
+            if device_info['device_type'] == 'Unknown':
+                device_info['device_type'] = 'Active Device'
+
     except Exception as e:
-        pass  # Skip malformed packets
+        pass
 
 def disable_monitor_mode(interface):
     """Disable monitor mode and restore normal interface operation"""
@@ -395,46 +414,49 @@ def signal_handler(sig, frame):
     console_print("\n[+] Stopping scan and cleaning up...", "yellow")
     sys.exit(0)
 
+def channel_hopper(interface):
+    """Hop between WiFi channels"""
+    while True:
+        for channel in range(1, 14):  # Channels 1-13
+            try:
+                subprocess.run(["iwconfig", interface, "channel", str(channel)], 
+                             stdout=subprocess.DEVNULL, 
+                             stderr=subprocess.DEVNULL)
+                time.sleep(0.3)  # Stay on each channel briefly
+            except:
+                pass
+
 def start_scan(interface):
     """Start the scanning process"""
     console.clear()
     console.print(Panel.fit(
         "[bold blue]Wireless Device Scanner[/bold blue]\n"
-        "[yellow]Scanning for all wireless devices in range...[/yellow]\n"
-        "[green]Will detect phones, laptops, IoT devices, and more[/green]\n"
-        "[red]Press Ctrl+C to stop scanning[/red]",
+        "[yellow]Scanning for all wireless devices...[/yellow]\n"
+        "[green]Press Ctrl+C to stop scanning[/green]",
         border_style="blue"
     ))
-    
+
+    # Start channel hopper in a separate thread
+    hopper = threading.Thread(target=channel_hopper, args=(interface,))
+    hopper.daemon = True
+    hopper.start()
+
     try:
-        # Set up Scapy's sniffing configuration
-        conf.iface = interface
-        conf.sniff_promisc = True
-        
-        # Create the live display
-        with Live(create_device_table(), refresh_per_second=1, console=console) as live:
+        with Live(create_device_table(), refresh_per_second=2) as live:
             def update_callback(pkt):
                 packet_handler(pkt)
                 try:
                     live.update(create_device_table())
                 except Exception as e:
                     pass
-            
-            # Start packet capture with channel hopping
-            channel_hop = subprocess.Popen(['airodump-ng', interface])
-            try:
-                sniff(iface=interface, prn=update_callback, store=0)
-            finally:
-                channel_hop.terminate()
-                
+
+            sniff(iface=interface, prn=update_callback, store=0)
+
     except KeyboardInterrupt:
         console.print("\n[bold green]Scan Complete![/bold green]")
-        console.print("\n[bold blue]Final Scan Summary:[/bold blue]")
+        console.print("\n[bold blue]Final Results:[/bold blue]")
         console.print(create_device_table())
-    except Exception as e:
-        console.print(f"\n[bold red]Error: {str(e)}[/bold red]")
     finally:
-        # Ensure we cleanup on any exit
         cleanup(interface)
 
 def main():
