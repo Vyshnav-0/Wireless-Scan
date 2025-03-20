@@ -40,23 +40,31 @@ PROJECTOR_IDENTIFIERS = {
     ]
 }
 
-# Add these new device type identifiers
+# Add more device signatures
 DEVICE_SIGNATURES = {
     'phones': {
-        'brands': ['iphone', 'samsung', 'xiaomi', 'huawei', 'oneplus', 'pixel'],
-        'keywords': ['phone', 'mobile', 'smartphone']
+        'brands': ['iphone', 'samsung', 'xiaomi', 'huawei', 'oneplus', 'pixel', 'redmi', 'oppo', 'vivo'],
+        'keywords': ['phone', 'mobile', 'smartphone', 'android']
     },
     'laptops': {
-        'brands': ['macbook', 'thinkpad', 'dell', 'hp', 'asus', 'acer'],
-        'keywords': ['laptop', 'notebook', 'computer']
+        'brands': ['macbook', 'thinkpad', 'dell', 'hp', 'asus', 'acer', 'lenovo', 'msi'],
+        'keywords': ['laptop', 'notebook', 'computer', 'pc']
     },
     'iot': {
-        'brands': ['nest', 'ring', 'alexa', 'echo', 'philips'],
-        'keywords': ['cam', 'thermostat', 'smart', 'iot', 'hub']
+        'brands': ['nest', 'ring', 'alexa', 'echo', 'philips', 'xiaomi', 'smart'],
+        'keywords': ['cam', 'thermostat', 'smart', 'iot', 'hub', 'switch', 'bulb']
     },
     'tablets': {
-        'brands': ['ipad', 'galaxy tab', 'surface'],
-        'keywords': ['tablet', 'pad']
+        'brands': ['ipad', 'galaxy tab', 'surface', 'kindle'],
+        'keywords': ['tablet', 'pad', 'reader']
+    },
+    'media': {
+        'brands': ['roku', 'firestick', 'chromecast', 'apple tv', 'nvidia shield'],
+        'keywords': ['tv', 'streaming', 'media', 'cast']
+    },
+    'wearables': {
+        'brands': ['fitbit', 'garmin', 'apple watch', 'galaxy watch'],
+        'keywords': ['watch', 'band', 'fitness']
     }
 }
 
@@ -174,7 +182,8 @@ def load_oui_database():
     """Load MAC address to company mapping"""
     console_print("[+] Loading MAC address database...", "blue")
     try:
-        response = urllib.request.urlopen(OUI_DATABASE_URL)
+        # Try to download the database
+        response = urllib.request.urlopen(OUI_DATABASE_URL, timeout=5)
         data = response.read().decode('utf-8')
         
         for line in data.split('\n'):
@@ -187,7 +196,17 @@ def load_oui_database():
                     
         console_print(f"[+] Loaded {len(MAC_TO_COMPANY)} company entries", "green")
     except Exception as e:
-        console_print("[-] Failed to load MAC database, continuing without company info", "yellow")
+        # If download fails, use a basic built-in database
+        console_print("[-] Using built-in MAC database", "yellow")
+        MAC_TO_COMPANY.update({
+            "00:00:0c": "Cisco",
+            "00:05:69": "VMware",
+            "00:17:88": "Philips",
+            "00:20:00": "Apple",
+            "00:26:ab": "Seiko Epson",
+            "00:1b:a9": "Brother",
+            # Add more common manufacturers
+        })
 
 def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
     """Get device manufacturer and type based on MAC and SSID"""
@@ -195,26 +214,41 @@ def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
     company = "Unknown"
     device_type = "Unknown"
     
-    # Try to get company name
-    for prefix, comp in MAC_TO_COMPANY.items():
-        if mac_prefix.startswith(prefix.lower()):
-            company = comp
-            break
+    # Try to get company name from local database first
+    try:
+        # Try exact match first
+        company = MAC_TO_COMPANY.get(mac_prefix, None)
+        if not company:
+            # Try partial match
+            for prefix, comp in MAC_TO_COMPANY.items():
+                if mac_prefix.startswith(prefix.lower()):
+                    company = comp
+                    break
+    except Exception:
+        pass
     
-    # Try to determine device type from SSID
+    # Try to determine device type
     if ssid:
         ssid_lower = ssid.lower()
         
-        # Check device signatures
+        # Check all device signatures
         for dev_type, signatures in DEVICE_SIGNATURES.items():
             if any(brand in ssid_lower for brand in signatures['brands']) or \
                any(keyword in ssid_lower for keyword in signatures['keywords']):
                 device_type = dev_type.title()
                 break
         
-        # Check projector signatures
+        # Check projector signatures separately
         if is_likely_projector(ssid, mac_addr):
             device_type = "Projector"
+            
+    # If still unknown, try to guess from company name
+    if device_type == "Unknown" and company != "Unknown":
+        company_lower = company.lower()
+        for dev_type, signatures in DEVICE_SIGNATURES.items():
+            if any(brand.lower() in company_lower for brand in signatures['brands']):
+                device_type = dev_type.title()
+                break
     
     return company, device_type
 
@@ -315,31 +349,40 @@ def start_scan(interface):
     """Start the scanning process"""
     console.clear()
     console.print(Panel.fit(
-        "[bold blue]Projector Scanner[/bold blue]\n"
-        "[yellow]Scanning for all types of projectors...[/yellow]\n"
-        "[green]Will detect both smart and traditional projectors[/green]\n"
+        "[bold blue]Wireless Device Scanner[/bold blue]\n"
+        "[yellow]Scanning for all wireless devices in range...[/yellow]\n"
+        "[green]Will detect phones, laptops, IoT devices, and more[/green]\n"
         "[red]Press Ctrl+C to stop scanning[/red]",
         border_style="blue"
     ))
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        transient=True,
-    ) as progress:
-        progress.add_task("Scanning...", total=None)
-        try:
-            with Live(create_device_table(), refresh_per_second=2) as live:
+    try:
+        # Create a progress display
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Scanning...", total=None)
+            
+            # Create the live display
+            with Live(create_device_table(), refresh_per_second=1, console=console) as live:
                 def update_callback(pkt):
                     packet_handler(pkt)
-                    live.update(create_device_table())
+                    try:
+                        live.update(create_device_table())
+                    except Exception as e:
+                        pass  # Handle any display errors gracefully
                 
+                # Start packet capture
                 sniff(iface=interface, prn=update_callback)
                 
-        except KeyboardInterrupt:
-            console.print("\n[bold green]Scan Complete![/bold green]")
-            console.print("\n[bold blue]Final Scan Summary:[/bold blue]")
-            console.print(create_device_table())
+    except KeyboardInterrupt:
+        console.print("\n[bold green]Scan Complete![/bold green]")
+        console.print("\n[bold blue]Final Scan Summary:[/bold blue]")
+        console.print(create_device_table())
+    except Exception as e:
+        console.print(f"\n[bold red]Error: {str(e)}[/bold red]")
 
 def main():
     """Main function to handle the workflow"""
