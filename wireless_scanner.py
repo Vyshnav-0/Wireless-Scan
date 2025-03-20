@@ -15,6 +15,8 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 import urllib.request
 import json
 from typing import Dict, Optional
+import signal
+import atexit
 
 # Initialize console for rich output
 console = Console()
@@ -362,6 +364,37 @@ def packet_handler(pkt):
     except Exception as e:
         pass  # Skip malformed packets
 
+def disable_monitor_mode(interface):
+    """Disable monitor mode and restore normal interface operation"""
+    try:
+        console_print("\n[+] Restoring wireless interface...", "blue")
+        
+        # Stop monitoring
+        subprocess.run(["airmon-ng", "stop", interface], stdout=subprocess.DEVNULL)
+        
+        # Restart NetworkManager
+        subprocess.run(["systemctl", "start", "NetworkManager"], stdout=subprocess.DEVNULL)
+        
+        console_print("[+] Wireless interface restored", "green")
+    except Exception as e:
+        console_print(f"[-] Error restoring interface: {str(e)}", "red")
+
+def cleanup(interface):
+    """Cleanup function to be called on exit"""
+    try:
+        # Kill any remaining airodump-ng processes
+        subprocess.run(["pkill", "airodump-ng"], stdout=subprocess.DEVNULL)
+        
+        # Disable monitor mode
+        disable_monitor_mode(interface)
+    except:
+        pass
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C and other signals"""
+    console_print("\n[+] Stopping scan and cleaning up...", "yellow")
+    sys.exit(0)
+
 def start_scan(interface):
     """Start the scanning process"""
     console.clear()
@@ -400,6 +433,9 @@ def start_scan(interface):
         console.print(create_device_table())
     except Exception as e:
         console.print(f"\n[bold red]Error: {str(e)}[/bold red]")
+    finally:
+        # Ensure we cleanup on any exit
+        cleanup(interface)
 
 def main():
     """Main function to handle the workflow"""
@@ -417,8 +453,17 @@ def main():
     # Enable monitor mode and get interface name
     mon_interface = enable_monitor_mode()
     
-    # Start scanning
-    start_scan(mon_interface)
+    # Register cleanup functions
+    atexit.register(cleanup, mon_interface)
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    try:
+        # Start scanning
+        start_scan(mon_interface)
+    finally:
+        # Ensure cleanup happens even on error
+        cleanup(mon_interface)
 
 if __name__ == "__main__":
     main() 
