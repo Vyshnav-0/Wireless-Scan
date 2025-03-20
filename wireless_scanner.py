@@ -1,0 +1,364 @@
+import os
+import sys
+import subprocess
+import venv
+from pathlib import Path
+from datetime import datetime
+from scapy.all import *
+from scapy.layers.dot11 import Dot11, Dot11Beacon, Dot11ProbeResp, Dot11Elt
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich.panel import Panel
+from rich import box
+from rich.progress import Progress, SpinnerColumn, TextColumn
+import urllib.request
+import json
+from typing import Dict, Optional
+
+# Initialize console for rich output
+console = Console()
+discovered_devices = {}
+
+# Add to global variables section
+OUI_DATABASE_URL = "https://raw.githubusercontent.com/wireshark/wireshark/master/manuf"
+MAC_TO_COMPANY: Dict[str, str] = {}
+
+# Enhanced projector detection keywords
+PROJECTOR_IDENTIFIERS = {
+    'brands': [
+        'epson', 'benq', 'viewsonic', 'optoma', 'sony', 'panasonic', 'nec', 
+        'hitachi', 'acer', 'dell', 'infocus', 'casio', 'vivitek', 'christie'
+    ],
+    'keywords': [
+        'projector', 'proj-', 'beamer', 'pj-', 'vga', 'hdmi', 'display',
+        'screen', 'presentation'
+    ],
+    'models': [
+        'eb-', 'emp-', 'powerlite', 'brightlink', 'w1', 'h1', 'x1', 'p1',
+        'mw-', 'mx-', 'mp-', 'ls-'
+    ]
+}
+
+# Add these new device type identifiers
+DEVICE_SIGNATURES = {
+    'phones': {
+        'brands': ['iphone', 'samsung', 'xiaomi', 'huawei', 'oneplus', 'pixel'],
+        'keywords': ['phone', 'mobile', 'smartphone']
+    },
+    'laptops': {
+        'brands': ['macbook', 'thinkpad', 'dell', 'hp', 'asus', 'acer'],
+        'keywords': ['laptop', 'notebook', 'computer']
+    },
+    'iot': {
+        'brands': ['nest', 'ring', 'alexa', 'echo', 'philips'],
+        'keywords': ['cam', 'thermostat', 'smart', 'iot', 'hub']
+    },
+    'tablets': {
+        'brands': ['ipad', 'galaxy tab', 'surface'],
+        'keywords': ['tablet', 'pad']
+    }
+}
+
+def console_print(message, color):
+    """Print colored messages before rich library is available"""
+    colors = {
+        "red": "\033[91m",
+        "green": "\033[92m",
+        "blue": "\033[94m",
+        "yellow": "\033[93m",
+        "end": "\033[0m"
+    }
+    print(f"{colors[color]}{message}{colors['end']}")
+
+def setup_environment():
+    """Setup virtual environment and install required packages"""
+    console_print("[+] Setting up environment...", "blue")
+    
+    venv_path = Path("./venv")
+    if not venv_path.exists():
+        console_print("[+] Creating virtual environment...", "blue")
+        venv.create(venv_path, with_pip=True)
+        
+        # Get the correct pip path
+        if os.name == "nt":  # Windows
+            pip_path = venv_path / "Scripts" / "pip"
+        else:  # Unix/Linux
+            pip_path = venv_path / "bin" / "pip"
+            
+        # Install required packages
+        console_print("[+] Installing required packages...", "blue")
+        subprocess.run([str(pip_path), "install", "scapy"])
+        subprocess.run([str(pip_path), "install", "rich"])
+        
+        console_print("[+] Setup complete!", "green")
+
+def enable_monitor_mode():
+    """Enable monitor mode on wireless interface"""
+    if os.name != "nt":  # Only for Linux
+        console_print("[+] Enabling monitor mode...", "blue")
+        
+        try:
+            result = subprocess.run(["iwconfig"], capture_output=True, text=True)
+            interfaces = [line.split()[0] for line in result.stdout.split('\n') if 'IEEE 802.11' in line]
+            
+            if not interfaces:
+                console_print("[-] No wireless interfaces found!", "red")
+                sys.exit(1)
+                
+            if len(interfaces) > 1:
+                console_print("[+] Multiple wireless interfaces found:", "blue")
+                for i, iface in enumerate(interfaces):
+                    console_print(f"    {i+1}. {iface}", "yellow")
+                choice = input("\nSelect interface number: ")
+                interface = interfaces[int(choice)-1]
+            else:
+                interface = interfaces[0]
+                
+            console_print(f"[+] Using interface: {interface}", "blue")
+            
+            subprocess.run(["airmon-ng", "check", "kill"], stdout=subprocess.DEVNULL)
+            subprocess.run(["airmon-ng", "start", interface], stdout=subprocess.DEVNULL)
+            
+            result = subprocess.run(["iwconfig"], capture_output=True, text=True)
+            mon_interface = next((line.split()[0] for line in result.stdout.split('\n') 
+                               if 'Mode:Monitor' in line), None)
+            
+            if not mon_interface:
+                console_print("[-] Failed to enable monitor mode!", "red")
+                sys.exit(1)
+                
+            return mon_interface
+            
+        except FileNotFoundError:
+            console_print("[-] Required tools not found! Installing...", "yellow")
+            subprocess.run(["apt-get", "update"])
+            subprocess.run(["apt-get", "install", "-y", "wireless-tools", "aircrack-ng"])
+            console_print("[+] Tools installed, please run the script again", "green")
+            sys.exit(1)
+    
+    return "wlan0mon"
+
+def check_root():
+    """Check if script is running with root privileges"""
+    if os.name != "nt" and os.geteuid() != 0:
+        console_print("[-] This script requires root privileges!", "red")
+        console_print("[*] Please run with sudo", "yellow")
+        sys.exit(1)
+
+def is_likely_projector(ssid, mac_addr):
+    """Enhanced projector detection logic"""
+    ssid_lower = ssid.lower() if ssid else ""
+    
+    # Check against known projector identifiers
+    for category in PROJECTOR_IDENTIFIERS.values():
+        if any(identifier in ssid_lower for identifier in category):
+            return True
+            
+    # Check common projector MAC prefixes (OUIs)
+    projector_ouis = {
+        'epson': ['00:26:ab', '00:1b:a9'],
+        'benq': ['00:6b:8e'],
+        'nec': ['00:16:41'],
+        'panasonic': ['00:13:43'],
+    }
+    
+    mac_prefix = mac_addr[:8].lower()
+    for brand, ouis in projector_ouis.items():
+        if any(oui.lower() in mac_prefix for oui in ouis):
+            return True
+    
+    return False
+
+def load_oui_database():
+    """Load MAC address to company mapping"""
+    console_print("[+] Loading MAC address database...", "blue")
+    try:
+        response = urllib.request.urlopen(OUI_DATABASE_URL)
+        data = response.read().decode('utf-8')
+        
+        for line in data.split('\n'):
+            if line and not line.startswith('#'):
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    mac_prefix = parts[0].strip().lower()
+                    company = parts[1].strip()
+                    MAC_TO_COMPANY[mac_prefix] = company
+                    
+        console_print(f"[+] Loaded {len(MAC_TO_COMPANY)} company entries", "green")
+    except Exception as e:
+        console_print("[-] Failed to load MAC database, continuing without company info", "yellow")
+
+def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
+    """Get device manufacturer and type based on MAC and SSID"""
+    mac_prefix = mac_addr[:8].lower()
+    company = "Unknown"
+    device_type = "Unknown"
+    
+    # Try to get company name
+    for prefix, comp in MAC_TO_COMPANY.items():
+        if mac_prefix.startswith(prefix.lower()):
+            company = comp
+            break
+    
+    # Try to determine device type from SSID
+    if ssid:
+        ssid_lower = ssid.lower()
+        
+        # Check device signatures
+        for dev_type, signatures in DEVICE_SIGNATURES.items():
+            if any(brand in ssid_lower for brand in signatures['brands']) or \
+               any(keyword in ssid_lower for keyword in signatures['keywords']):
+                device_type = dev_type.title()
+                break
+        
+        # Check projector signatures
+        if is_likely_projector(ssid, mac_addr):
+            device_type = "Projector"
+    
+    return company, device_type
+
+def create_device_table():
+    """Create and update the device table"""
+    table = Table(box=box.ROUNDED)
+    table.add_column("MAC Address", style="cyan")
+    table.add_column("Company", style="magenta")
+    table.add_column("Device Type", style="red")
+    table.add_column("SSID/Name", style="green")
+    table.add_column("Signal Strength", style="yellow")
+    table.add_column("Details", style="white")
+    
+    for mac, info in discovered_devices.items():
+        signal_strength = f"{info['signal_strength']} dBm"
+        device_type = info['device_type']
+        style = "bold red" if device_type == "Projector" else None
+        
+        details = []
+        if info.get('connection_type'):
+            details.append(info['connection_type'])
+        if info.get('last_seen'):
+            details.append(f"Last seen: {info['last_seen'].strftime('%H:%M:%S')}")
+        
+        table.add_row(
+            mac,
+            info['company'],
+            device_type,
+            info['ssid'] or "N/A",
+            signal_strength,
+            "\n".join(details) if details else "",
+            style=style
+        )
+    return table
+
+def packet_handler(pkt):
+    """Handle captured packets"""
+    if pkt.haslayer(Dot11):
+        if pkt.addr2:
+            try:
+                signal_strength = -(256-ord(pkt.notdecoded[-4:-3]))
+                
+                if pkt.addr2 not in discovered_devices:
+                    company, device_type = get_device_info(pkt.addr2)
+                    discovered_devices[pkt.addr2] = {
+                        'first_seen': datetime.now(),
+                        'last_seen': datetime.now(),
+                        'signal_strength': signal_strength,
+                        'ssid': None,
+                        'device_type': device_type,
+                        'company': company,
+                        'connection_type': None
+                    }
+                    console.print(f"\n[bold green]New Device Found:[/bold green]")
+                    console.print(f"MAC Address: [cyan]{pkt.addr2}[/cyan]")
+                    console.print(f"Company: [magenta]{company}[/magenta]")
+                    console.print(f"Type: [red]{device_type}[/red]")
+                    console.print(f"Signal Strength: [yellow]{signal_strength} dBm[/yellow]")
+                
+                # Update last seen and signal strength
+                device_info = discovered_devices[pkt.addr2]
+                device_info['last_seen'] = datetime.now()
+                if signal_strength > device_info['signal_strength']:
+                    device_info['signal_strength'] = signal_strength
+                
+                # Process SSID information
+                if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
+                    if pkt.info:
+                        ssid = pkt.info.decode()
+                        device_info['ssid'] = ssid
+                        
+                        # Update device type based on SSID
+                        company, new_type = get_device_info(pkt.addr2, ssid)
+                        if new_type != "Unknown":
+                            device_info['device_type'] = new_type
+                        
+                        # Special handling for projectors
+                        if new_type == "Projector":
+                            if 'wifi' in ssid.lower() or 'wireless' in ssid.lower():
+                                device_info['connection_type'] = 'WiFi Capable'
+                            else:
+                                device_info['connection_type'] = 'Traditional'
+                            
+                            console.print(Panel.fit(
+                                f"""[bold red]Projector Found![/bold red]
+Company: [magenta]{company}[/magenta]
+Name: [green]{ssid}[/green]
+MAC: [cyan]{pkt.addr2}[/cyan]
+Type: [yellow]{device_info['connection_type']}[/yellow]
+Signal Strength: [yellow]{signal_strength} dBm[/yellow]""",
+                                border_style="red"
+                            ))
+            
+            except Exception as e:
+                pass  # Skip malformed packets
+
+def start_scan(interface):
+    """Start the scanning process"""
+    console.clear()
+    console.print(Panel.fit(
+        "[bold blue]Projector Scanner[/bold blue]\n"
+        "[yellow]Scanning for all types of projectors...[/yellow]\n"
+        "[green]Will detect both smart and traditional projectors[/green]\n"
+        "[red]Press Ctrl+C to stop scanning[/red]",
+        border_style="blue"
+    ))
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        transient=True,
+    ) as progress:
+        progress.add_task("Scanning...", total=None)
+        try:
+            with Live(create_device_table(), refresh_per_second=2) as live:
+                def update_callback(pkt):
+                    packet_handler(pkt)
+                    live.update(create_device_table())
+                
+                sniff(iface=interface, prn=update_callback)
+                
+        except KeyboardInterrupt:
+            console.print("\n[bold green]Scan Complete![/bold green]")
+            console.print("\n[bold blue]Final Scan Summary:[/bold blue]")
+            console.print(create_device_table())
+
+def main():
+    """Main function to handle the workflow"""
+    print("\n=== Wireless Device Scanner ===\n")
+    
+    # Check if running as root
+    check_root()
+    
+    # Setup virtual environment
+    setup_environment()
+    
+    # Load MAC address database
+    load_oui_database()
+    
+    # Enable monitor mode and get interface name
+    mon_interface = enable_monitor_mode()
+    
+    # Start scanning
+    start_scan(mon_interface)
+
+if __name__ == "__main__":
+    main() 
