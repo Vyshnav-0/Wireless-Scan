@@ -44,31 +44,42 @@ PROJECTOR_IDENTIFIERS = {
     ]
 }
 
-# Add more device signatures
+# Add more detailed device signatures
 DEVICE_SIGNATURES = {
-    'phones': {
-        'brands': ['iphone', 'samsung', 'xiaomi', 'huawei', 'oneplus', 'pixel', 'redmi', 'oppo', 'vivo'],
-        'keywords': ['phone', 'mobile', 'smartphone', 'android']
+    'mobile': {
+        'brands': ['iphone', 'samsung', 'xiaomi', 'huawei', 'oneplus', 'pixel', 'redmi', 'oppo', 'vivo', 'realme'],
+        'keywords': ['phone', 'mobile', 'smartphone', 'android', 'iphone'],
+        'oui': {
+            'apple': ['00:23:32', '00:0A:95', 'A8:5C:2C'],
+            'samsung': ['00:07:AB', '00:21:19', '94:35:0A'],
+            'xiaomi': ['00:9E:C8', '58:44:98'],
+            'huawei': ['00:E0:FC', '00:18:82']
+        }
     },
-    'laptops': {
+    'laptop': {
         'brands': ['macbook', 'thinkpad', 'dell', 'hp', 'asus', 'acer', 'lenovo', 'msi'],
-        'keywords': ['laptop', 'notebook', 'computer', 'pc']
+        'keywords': ['laptop', 'notebook', 'computer', 'pc', 'macbook'],
+        'oui': {
+            'apple': ['00:03:93', '00:0A:27'],
+            'dell': ['00:06:5B', '00:14:22'],
+            'lenovo': ['00:09:2D', '00:24:7E']
+        }
     },
-    'iot': {
-        'brands': ['nest', 'ring', 'alexa', 'echo', 'philips', 'xiaomi', 'smart'],
-        'keywords': ['cam', 'thermostat', 'smart', 'iot', 'hub', 'switch', 'bulb']
-    },
-    'tablets': {
+    'tablet': {
         'brands': ['ipad', 'galaxy tab', 'surface', 'kindle'],
-        'keywords': ['tablet', 'pad', 'reader']
+        'keywords': ['tablet', 'pad', 'reader'],
+        'oui': {
+            'apple': ['00:1C:B3', '00:26:08'],
+            'samsung': ['00:15:99', '00:13:77']
+        }
     },
-    'media': {
-        'brands': ['roku', 'firestick', 'chromecast', 'apple tv', 'nvidia shield'],
-        'keywords': ['tv', 'streaming', 'media', 'cast']
-    },
-    'wearables': {
-        'brands': ['fitbit', 'garmin', 'apple watch', 'galaxy watch'],
-        'keywords': ['watch', 'band', 'fitness']
+    'smartwatch': {
+        'brands': ['apple watch', 'galaxy watch', 'fitbit', 'garmin'],
+        'keywords': ['watch', 'band', 'fitness'],
+        'oui': {
+            'apple': ['00:22:41', '00:25:00'],
+            'fitbit': ['00:1C:B1']
+        }
     }
 }
 
@@ -284,21 +295,67 @@ def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
             
     return company, device_type
 
+def get_device_type(mac_addr: str, ssid: Optional[str] = None, company: str = "Unknown") -> str:
+    """Enhanced device type detection"""
+    if not mac_addr:
+        return "Unknown"
+
+    try:
+        mac_prefix = mac_addr[:8].lower()
+        
+        # First check OUI-based device type
+        for device_type, info in DEVICE_SIGNATURES.items():
+            if 'oui' in info:
+                for brand, ouis in info['oui'].items():
+                    if any(mac_addr.lower().startswith(oui.lower().replace(':', '')) for oui in ouis):
+                        return device_type.title()
+
+        # Then check SSID-based detection
+        if ssid:
+            ssid_lower = ssid.lower()
+            for device_type, info in DEVICE_SIGNATURES.items():
+                if any(brand in ssid_lower for brand in info['brands']) or \
+                   any(keyword in ssid_lower for keyword in info['keywords']):
+                    return device_type.title()
+
+        # Finally check company name
+        company_lower = company.lower()
+        for device_type, info in DEVICE_SIGNATURES.items():
+            if any(brand in company_lower for brand in info['brands']):
+                return device_type.title()
+
+    except Exception:
+        pass
+
+    return "Unknown"
+
 def create_device_table():
     """Create and update the device table"""
-    table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        box=box.ROUNDED,
+        title="[bold blue]Active Wireless Devices[/bold blue]",
+        caption="[italic]Press Ctrl+C to stop scanning[/italic]"
+    )
+    
     table.add_column("MAC Address", style="cyan", width=17)
     table.add_column("Company", style="magenta", width=20)
-    table.add_column("Type", style="red", width=15)
-    table.add_column("Name/SSID", style="green", width=20)
+    table.add_column("Device Type", style="red", width=15)
+    table.add_column("Name/SSID", style="green", width=25)
     table.add_column("Signal", style="yellow", width=8)
     table.add_column("Last Seen", style="blue", width=8)
 
     try:
-        # Sort devices by signal strength
+        # Get active devices (seen in last 30 seconds)
+        active_devices = [
+            (mac, info) for mac, info in discovered_devices.items()
+            if (datetime.now() - info['last_seen']).total_seconds() <= 30
+        ]
+
+        # Sort by signal strength
         sorted_devices = sorted(
-            [(mac, info) for mac, info in discovered_devices.items()
-             if (datetime.now() - info['last_seen']).total_seconds() <= 60],
+            active_devices,
             key=lambda x: x[1]['signal_strength'],
             reverse=True
         )
@@ -309,14 +366,20 @@ def create_device_table():
             name = info['ssid'] if info['ssid'] else 'N/A'
             last_seen = info['last_seen'].strftime("%H:%M:%S")
 
-            # Determine row style
+            # Style based on device type
             style = None
             if info['is_ap']:
                 style = "bold blue"
+            elif device_type == "Mobile":
+                style = "bold green"
+            elif device_type == "Laptop":
+                style = "bold yellow"
+            elif device_type == "Tablet":
+                style = "bold magenta"
+            elif device_type == "Smartwatch":
+                style = "bold cyan"
             elif device_type == "Projector":
                 style = "bold red"
-            elif device_type != "Unknown":
-                style = "bold white"
 
             table.add_row(
                 mac,
@@ -334,19 +397,17 @@ def create_device_table():
     return table
 
 def packet_handler(pkt):
-    """Handle captured packets"""
+    """Enhanced packet handler with better device detection"""
     try:
         if not pkt.haslayer(Dot11):
             return
 
-        # Get all possible MAC addresses from the packet
+        # Get valid MAC addresses
         addresses = set()
-        
-        # Check all possible address fields with validation
         for field in ['addr1', 'addr2', 'addr3']:
             if hasattr(pkt, field):
                 addr = getattr(pkt, field)
-                if addr and isinstance(addr, str):  # Validate MAC address
+                if addr and isinstance(addr, str):
                     if not addr.startswith(('ff:ff:ff', '00:00:00', '33:33:', '01:00:5e')):
                         addresses.add(addr)
 
@@ -366,7 +427,9 @@ def packet_handler(pkt):
 
             # Process new device
             if mac_address not in discovered_devices:
-                company, device_type = get_device_info(mac_address)
+                company, _ = get_device_info(mac_address)
+                device_type = get_device_type(mac_address, company=company)
+                
                 discovered_devices[mac_address] = {
                     'first_seen': datetime.now(),
                     'last_seen': datetime.now(),
@@ -378,10 +441,16 @@ def packet_handler(pkt):
                     'probe_requests': set(),
                     'is_ap': False
                 }
-                console.print(f"\n[bold green]New Device Found:[/bold green]")
-                console.print(f"MAC: [cyan]{mac_address}[/cyan]")
-                console.print(f"Company: [magenta]{company}[/magenta]")
-                console.print(f"Type: [red]{device_type}[/red]")
+
+                # Print new device with more details
+                console.print(Panel.fit(
+                    f"[bold green]New Device Found![/bold green]\n"
+                    f"MAC: [cyan]{mac_address}[/cyan]\n"
+                    f"Type: [red]{device_type}[/red]\n"
+                    f"Company: [magenta]{company}[/magenta]\n"
+                    f"Signal: [yellow]{signal_strength} dBm[/yellow]",
+                    border_style="green"
+                ))
 
             device_info = discovered_devices[mac_address]
             device_info['last_seen'] = datetime.now()
@@ -389,26 +458,30 @@ def packet_handler(pkt):
             if signal_strength > device_info['signal_strength']:
                 device_info['signal_strength'] = signal_strength
 
-            # Process SSID information
+            # Process SSID and update device type
             if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
                 try:
                     if hasattr(pkt, 'info') and pkt.info:
                         ssid = pkt.info.decode().strip()
-                        if ssid:  # Only process non-empty SSIDs
+                        if ssid:
                             device_info['ssid'] = ssid
-                            if mac_address == pkt.addr3:  # This is an AP
+                            if mac_address == pkt.addr3:
                                 device_info['is_ap'] = True
                                 device_info['device_type'] = 'Access Point'
+                            else:
+                                # Update device type based on SSID
+                                new_type = get_device_type(mac_address, ssid, device_info['company'])
+                                if new_type != "Unknown":
+                                    device_info['device_type'] = new_type
                 except:
                     pass
 
-            # Mark data-sending devices as active
-            if pkt.type == 2:  # Data frames
-                if device_info['device_type'] == 'Unknown':
-                    device_info['device_type'] = 'Active Device'
+            # Update device type for data frames
+            if pkt.type == 2 and device_info['device_type'] == "Unknown":
+                device_info['device_type'] = get_device_type(mac_address, company=device_info['company'])
 
     except Exception as e:
-        pass  # Silently handle errors to keep scanning
+        pass
 
 def disable_monitor_mode(interface):
     """Disable monitor mode and restore normal interface operation"""
