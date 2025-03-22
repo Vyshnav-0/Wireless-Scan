@@ -286,7 +286,7 @@ def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
 
 def create_device_table():
     """Create and update the device table"""
-    table = Table(box=box.ROUNDED)
+    table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
     table.add_column("MAC Address", style="cyan", width=17)
     table.add_column("Company", style="magenta", width=20)
     table.add_column("Type", style="red", width=15)
@@ -294,41 +294,42 @@ def create_device_table():
     table.add_column("Signal", style="yellow", width=8)
     table.add_column("Last Seen", style="blue", width=8)
 
-    # Sort devices by signal strength
-    sorted_devices = sorted(
-        discovered_devices.items(),
-        key=lambda x: x[1]['signal_strength'],
-        reverse=True
-    )
-
-    for mac, info in sorted_devices:
-        # Skip devices not seen in last 60 seconds
-        if (datetime.now() - info['last_seen']).total_seconds() > 60:
-            continue
-
-        signal = f"{info['signal_strength']} dBm"
-        device_type = info['device_type']
-        name = info['ssid'] if info['ssid'] else 'N/A'
-        last_seen = info['last_seen'].strftime("%H:%M:%S")
-
-        # Determine row style
-        style = None
-        if info['is_ap']:
-            style = "bold blue"
-        elif device_type == "Projector":
-            style = "bold red"
-        elif device_type != "Unknown":
-            style = "bold white"
-
-        table.add_row(
-            mac,
-            info['company'],
-            device_type,
-            name,
-            signal,
-            last_seen,
-            style=style
+    try:
+        # Sort devices by signal strength
+        sorted_devices = sorted(
+            [(mac, info) for mac, info in discovered_devices.items()
+             if (datetime.now() - info['last_seen']).total_seconds() <= 60],
+            key=lambda x: x[1]['signal_strength'],
+            reverse=True
         )
+
+        for mac, info in sorted_devices:
+            signal = f"{info['signal_strength']} dBm"
+            device_type = info['device_type']
+            name = info['ssid'] if info['ssid'] else 'N/A'
+            last_seen = info['last_seen'].strftime("%H:%M:%S")
+
+            # Determine row style
+            style = None
+            if info['is_ap']:
+                style = "bold blue"
+            elif device_type == "Projector":
+                style = "bold red"
+            elif device_type != "Unknown":
+                style = "bold white"
+
+            table.add_row(
+                mac,
+                info['company'],
+                device_type,
+                name,
+                signal,
+                last_seen,
+                style=style
+            )
+
+    except Exception as e:
+        console.print(f"[red]Error creating table: {str(e)}[/red]")
 
     return table
 
@@ -427,28 +428,33 @@ def disable_monitor_mode(interface):
 def cleanup(interface):
     """Cleanup function to be called on exit"""
     try:
-        # Kill any remaining airodump-ng processes
-        subprocess.run(["pkill", "airodump-ng"], stdout=subprocess.DEVNULL)
+        # Kill any remaining processes
+        subprocess.run(["pkill", "airodump-ng"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["pkill", "iwconfig"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         # Disable monitor mode
         disable_monitor_mode(interface)
+        
+        # Force exit after cleanup
+        os._exit(0)
     except:
-        pass
+        os._exit(1)
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C and other signals"""
-    console_print("\n[+] Stopping scan and cleaning up...", "yellow")
-    sys.exit(0)
+    console.print("\n[bold yellow]Stopping scan and cleaning up...[/bold yellow]")
+    # Let the main thread handle cleanup
+    raise KeyboardInterrupt
 
-def channel_hopper(interface):
+def channel_hopper(interface, stop_event):
     """Hop between WiFi channels"""
-    while True:
+    while not stop_event.is_set():
         for channel in range(1, 14):  # Channels 1-13
+            if stop_event.is_set():
+                break
             try:
-                os.system(f"iwconfig {interface} channel {channel}")
-                # Print channel change (temporary for debugging)
-                console.print(f"[yellow]Scanning channel {channel}[/yellow]", end="\r")
-                time.sleep(0.5)  # Stay longer on each channel
+                os.system(f"iwconfig {interface} channel {channel} 2>/dev/null")
+                time.sleep(0.3)
             except:
                 pass
 
@@ -462,63 +468,73 @@ def start_scan(interface):
         border_style="blue"
     ))
 
-    # Configure Scapy for better packet capture
+    # Configure Scapy
     conf.iface = interface
     conf.sniff_promisc = True
-    
-    # Start channel hopper in a separate thread
-    hopper = threading.Thread(target=channel_hopper, args=(interface,))
+
+    # Create stop event for clean exit
+    stop_event = threading.Event()
+
+    # Start channel hopper
+    hopper = threading.Thread(target=channel_hopper, args=(interface, stop_event))
     hopper.daemon = True
     hopper.start()
 
     try:
-        with Live(create_device_table(), refresh_per_second=1) as live:
+        with Live(create_device_table(), refresh_per_second=1, screen=True) as live:
             def update_callback(pkt):
+                if stop_event.is_set():
+                    return True  # Stop sniffing
                 packet_handler(pkt)
                 try:
                     live.update(create_device_table())
-                except Exception as e:
+                except Exception:
                     pass
 
-            # Start packet capture
+            # Start capture
             sniff(iface=interface,
                  prn=update_callback,
                  store=0,
-                 monitor=True)
+                 stop_filter=lambda _: stop_event.is_set())
 
     except KeyboardInterrupt:
+        stop_event.set()  # Signal threads to stop
         console.print("\n[bold green]Scan Complete![/bold green]")
         console.print("\n[bold blue]Final Results:[/bold blue]")
         console.print(create_device_table())
     finally:
+        stop_event.set()  # Ensure threads stop
         cleanup(interface)
 
 def main():
     """Main function to handle the workflow"""
-    print("\n=== Wireless Device Scanner ===\n")
-    
-    # Check if running as root
-    check_root()
-    
-    # Setup virtual environment
-    setup_environment()
-    
-    # Load MAC address database
-    load_oui_database()
-    
-    # Enable monitor mode and get interface name
-    mon_interface = enable_monitor_mode()
-    
-    # Register cleanup functions
-    atexit.register(cleanup, mon_interface)
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
     try:
+        print("\n=== Wireless Device Scanner ===\n")
+        
+        # Check if running as root
+        check_root()
+        
+        # Setup virtual environment
+        setup_environment()
+        
+        # Load MAC address database
+        load_oui_database()
+        
+        # Enable monitor mode and get interface name
+        mon_interface = enable_monitor_mode()
+        
+        # Register cleanup functions
+        atexit.register(cleanup, mon_interface)
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        
         # Start scanning
         start_scan(mon_interface)
-    finally:
-        # Ensure cleanup happens even on error
+        
+    except KeyboardInterrupt:
+        cleanup(mon_interface)
+    except Exception as e:
+        console.print(f"[bold red]Error: {str(e)}[/bold red]")
         cleanup(mon_interface)
 
 if __name__ == "__main__":
