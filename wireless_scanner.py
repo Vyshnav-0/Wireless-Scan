@@ -241,7 +241,14 @@ def load_oui_database():
 
 def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
     """Get device manufacturer and type based on MAC and SSID"""
-    mac_prefix = mac_addr[:8].lower()
+    if not mac_addr:  # Add check for None
+        return "Unknown", "Unknown"
+        
+    try:
+        mac_prefix = mac_addr[:8].lower()
+    except (AttributeError, TypeError):
+        return "Unknown", "Unknown"
+        
     company = "Unknown"
     device_type = "Unknown"
     
@@ -258,29 +265,23 @@ def get_device_info(mac_addr: str, ssid: Optional[str] = None) -> tuple:
     except Exception:
         pass
     
-    # Try to determine device type
+    # Try to determine device type from SSID
     if ssid:
-        ssid_lower = ssid.lower()
-        
-        # Check all device signatures
-        for dev_type, signatures in DEVICE_SIGNATURES.items():
-            if any(brand in ssid_lower for brand in signatures['brands']) or \
-               any(keyword in ssid_lower for keyword in signatures['keywords']):
-                device_type = dev_type.title()
-                break
-        
-        # Check projector signatures separately
-        if is_likely_projector(ssid, mac_addr):
-            device_type = "Projector"
+        try:
+            ssid_lower = ssid.lower()
+            # Check all device signatures
+            for dev_type, signatures in DEVICE_SIGNATURES.items():
+                if any(brand in ssid_lower for brand in signatures['brands']) or \
+                   any(keyword in ssid_lower for keyword in signatures['keywords']):
+                    device_type = dev_type.title()
+                    break
             
-    # If still unknown, try to guess from company name
-    if device_type == "Unknown" and company != "Unknown":
-        company_lower = company.lower()
-        for dev_type, signatures in DEVICE_SIGNATURES.items():
-            if any(brand.lower() in company_lower for brand in signatures['brands']):
-                device_type = dev_type.title()
-                break
-    
+            # Check projector signatures separately
+            if is_likely_projector(ssid, mac_addr):
+                device_type = "Projector"
+        except (AttributeError, TypeError):
+            pass
+            
     return company, device_type
 
 def create_device_table():
@@ -340,23 +341,16 @@ def packet_handler(pkt):
         # Get all possible MAC addresses from the packet
         addresses = set()
         
-        # Check all possible address fields
-        if hasattr(pkt, 'addr1') and pkt.addr1:
-            addresses.add(pkt.addr1)
-        if hasattr(pkt, 'addr2') and pkt.addr2:
-            addresses.add(pkt.addr2)
-        if hasattr(pkt, 'addr3') and pkt.addr3:
-            addresses.add(pkt.addr3)
-
-        # Filter out broadcast and multicast addresses
-        addresses = {addr for addr in addresses if addr and 
-                    not addr.startswith(('ff:ff:ff', '00:00:00', '33:33:', '01:00:5e'))}
+        # Check all possible address fields with validation
+        for field in ['addr1', 'addr2', 'addr3']:
+            if hasattr(pkt, field):
+                addr = getattr(pkt, field)
+                if addr and isinstance(addr, str):  # Validate MAC address
+                    if not addr.startswith(('ff:ff:ff', '00:00:00', '33:33:', '01:00:5e')):
+                        addresses.add(addr)
 
         if not addresses:
             return
-
-        # Debug print (temporary)
-        console.print(f"[cyan]Found MAC: {addresses}[/cyan]", end="\r")
 
         for mac_address in addresses:
             # Get signal strength
@@ -383,7 +377,6 @@ def packet_handler(pkt):
                     'probe_requests': set(),
                     'is_ap': False
                 }
-                # Print new device discovery
                 console.print(f"\n[bold green]New Device Found:[/bold green]")
                 console.print(f"MAC: [cyan]{mac_address}[/cyan]")
                 console.print(f"Company: [magenta]{company}[/magenta]")
@@ -397,15 +390,16 @@ def packet_handler(pkt):
 
             # Process SSID information
             if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
-                if hasattr(pkt, 'info') and pkt.info:
-                    try:
-                        ssid = pkt.info.decode()
-                        device_info['ssid'] = ssid
-                        if mac_address == pkt.addr3:  # This is an AP
-                            device_info['is_ap'] = True
-                            device_info['device_type'] = 'Access Point'
-                    except:
-                        pass
+                try:
+                    if hasattr(pkt, 'info') and pkt.info:
+                        ssid = pkt.info.decode().strip()
+                        if ssid:  # Only process non-empty SSIDs
+                            device_info['ssid'] = ssid
+                            if mac_address == pkt.addr3:  # This is an AP
+                                device_info['is_ap'] = True
+                                device_info['device_type'] = 'Access Point'
+                except:
+                    pass
 
             # Mark data-sending devices as active
             if pkt.type == 2:  # Data frames
@@ -413,7 +407,7 @@ def packet_handler(pkt):
                     device_info['device_type'] = 'Active Device'
 
     except Exception as e:
-        console.print(f"[red]Error: {str(e)}[/red]", end="\r")
+        pass  # Silently handle errors to keep scanning
 
 def disable_monitor_mode(interface):
     """Disable monitor mode and restore normal interface operation"""
@@ -472,12 +466,10 @@ def start_scan(interface):
     conf.iface = interface
     conf.sniff_promisc = True
     
-    # Don't use pcap as it might cause issues
-    conf.use_pcap = False
-    
-    # Add monitor mode configuration
-    os.system(f"iwconfig {interface} mode monitor")
-    os.system(f"ifconfig {interface} up")
+    # Start channel hopper in a separate thread
+    hopper = threading.Thread(target=channel_hopper, args=(interface,))
+    hopper.daemon = True
+    hopper.start()
 
     try:
         with Live(create_device_table(), refresh_per_second=1) as live:
@@ -488,11 +480,11 @@ def start_scan(interface):
                 except Exception as e:
                     pass
 
-            # Start packet capture with specific filter for all 802.11 packets
+            # Start packet capture
             sniff(iface=interface,
                  prn=update_callback,
                  store=0,
-                 lfilter=lambda x: x.haslayer(Dot11))
+                 monitor=True)
 
     except KeyboardInterrupt:
         console.print("\n[bold green]Scan Complete![/bold green]")
